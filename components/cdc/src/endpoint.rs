@@ -760,6 +760,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
             }
         };
         self.tso_worker.spawn(fut);
+        self.flush_all();
     }
 
     async fn region_resolved_ts_raft(
