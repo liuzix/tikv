@@ -289,7 +289,7 @@ where
 
             let latest_resolved_ts = event.get_resolved_ts().get_ts();
             if latest_resolved_ts > 0 {
-                CDC_GRPC_WRITE_RESOLVED_TS.add(latest_resolved_ts as i64);
+                CDC_GRPC_WRITE_RESOLVED_TS.set(latest_resolved_ts as i64);
             }
 
             this.inner_sink.start_send_unpin((event, flag))?;
