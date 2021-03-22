@@ -12,7 +12,6 @@ extern crate fail;
 extern crate tikv_util;
 extern crate futures;
 extern crate tokio;
-extern crate tokio_retry;
 
 mod delegate;
 mod endpoint;
