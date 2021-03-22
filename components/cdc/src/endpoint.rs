@@ -47,7 +47,7 @@ use crate::metrics::*;
 use crate::service::{CdcEvent, Conn, ConnID, FeatureGate};
 use crate::{CdcObserver, Error, Result};
 use futures::stream::StreamExt;
-use futures::{try_join, TryFutureExt, Future};
+use futures::{try_join, Future, TryFutureExt};
 
 pub enum Deregister {
     Downstream {
@@ -418,14 +418,17 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
         }
     }
 
-    fn get_current_resolved_ts(&self, region_id: u64, observer_id: ObserveID) -> impl Future<Output = Option<TimeStamp>> {
+    fn get_current_resolved_ts(
+        &self,
+        region_id: u64,
+        observer_id: ObserveID,
+    ) -> impl Future<Output = Option<TimeStamp>> {
         let pd_client = self.pd_client.clone();
         let cm = self.concurrency_manager.clone();
         let raft_router = self.raft_router.clone();
         let scheduler = self.scheduler.clone();
         let regions = vec![(region_id, observer_id)];
-    
-        
+
         async move {
             let mut min_ts = pd_client.get_tso().await.unwrap_or_default();
 
@@ -436,7 +439,8 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
                 }
             }
 
-            let valid_regions = Self::region_resolved_ts_raft(regions, &scheduler, raft_router, min_ts).await;
+            let valid_regions =
+                Self::region_resolved_ts_raft(regions, &scheduler, raft_router, min_ts).await;
             if valid_regions.len() == 0 {
                 return None;
             }
@@ -1212,13 +1216,17 @@ impl Initializer {
             scanner: RefCell::new(scanner),
         }));
 
-        let incremental_scan_state = self.downstream.as_ref().unwrap().get_incremental_scan_state();
+        let incremental_scan_state = self
+            .downstream
+            .as_ref()
+            .unwrap()
+            .get_incremental_scan_state();
         {
             let mut st = incremental_scan_state.lock().unwrap();
             match *st {
                 IncrementalScanState::NotStarted => {
                     *st = IncrementalScanState::Ongoing;
-                },
+                }
                 ref other => {
                     panic!("unexpected incremental scan state {:?}", other);
                 }
@@ -1284,7 +1292,7 @@ impl Initializer {
                     match rate_limiter.send_scan_event(CdcEvent::Event(event)).await {
                         Ok(_) => {
                             debug!("cdc incremental scan sent data"; "num_entires" => num_entires)
-                        },
+                        }
                         Err(e) => {
                             error!("cdc scan entries failed"; "error" => ?e, "region_id" => region_id);
                             // TODO: record in metrics.
@@ -1312,20 +1320,25 @@ impl Initializer {
             ..Default::default()
         };
 
-        self.downstream.as_ref().unwrap().get_rate_limiter().unwrap().send_realtime_event(CdcEvent::ResolvedTs(resolved_ts));
+        self.downstream
+            .as_ref()
+            .unwrap()
+            .get_rate_limiter()
+            .unwrap()
+            .send_realtime_event(CdcEvent::ResolvedTs(resolved_ts));
 
         // handle the case where the region has already deregistered
         {
             let mut st = incremental_scan_state.lock().unwrap();
             match std::mem::replace(&mut *st, IncrementalScanState::Done) {
                 // normal case
-                IncrementalScanState::Ongoing => {},
+                IncrementalScanState::Ongoing => {}
                 // real time stream has terminiated due to region error (splitting, etc.)
                 IncrementalScanState::ErrorPending(err_event) => {
                     info!("cdc incremental scan finished after region error, sending error"; "err_event" => ?err_event);
                     self.downstream_state.store(DownstreamState::Stopped);
                     self.downstream.as_ref().unwrap().sink_error(err_event);
-                },
+                }
                 other => {
                     panic!("unexpected incremental scan state {:?}", other);
                 }

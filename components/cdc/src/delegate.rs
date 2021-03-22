@@ -391,15 +391,15 @@ impl Delegate {
                 match *incremental_state {
                     IncrementalScanState::Ongoing => {
                         info!("cdc incremental scan not done, holding off error"; "region_id" => self.region_id);
-                        *incremental_state = IncrementalScanState::ErrorPending(change_data_err.clone())
-                    },
+                        *incremental_state =
+                            IncrementalScanState::ErrorPending(change_data_err.clone())
+                    }
                     _ => {
                         d.state.store(DownstreamState::Stopped);
                         d.sink_error(change_data_err.clone());
-                    },
+                    }
                 }
             }
-            
         }
     }
 

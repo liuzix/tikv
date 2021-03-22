@@ -24,6 +24,7 @@ use tokio::sync::mpsc::channel as tokio_bounded_channel;
 
 use crate::delegate::{Downstream, DownstreamID};
 use crate::endpoint::{Deregister, Task};
+use crate::metrics::*;
 use crate::rate_limiter::{new_pair, DrainerError, RateLimiter};
 use futures::ready;
 #[cfg(feature = "prost-codec")]
@@ -36,7 +37,6 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch::Ref;
-use crate::metrics::*;
 
 static CONNECTION_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
 
