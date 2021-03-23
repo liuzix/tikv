@@ -577,29 +577,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
             }
         };
         let scheduler = self.scheduler.clone();
-        if let Err(e) = self.raft_router.significant_send(
-            region_id,
-            SignificantMsg::CaptureChange {
-                cmd: change_cmd,
-                region_epoch: request.take_region_epoch(),
-                callback: Callback::Read(Box::new(move |resp| {
-                    info!("cdc init down stream"; "region_id" => region_id);
-                    if let Err(e) = scheduler.schedule(Task::InitDownstream {
-                        downstream_id,
-                        downstream_state,
-                        cb: Box::new(move || {
-                            cb(resp);
-                        }),
-                    }) {
-                        error!("schedule cdc task failed"; "error" => ?e);
-                    }
-                })),
-            },
-        ) {
-            deregister_downstream(Error::Request(e.into()));
-            return;
-        }
-
+        let raft_router = self.raft_router.clone();
         let get_current_resolved_ts_fut = self.get_current_resolved_ts(region_id, init.observe_id);
         self.workers.spawn(async move {
             match get_current_resolved_ts_fut.await {
@@ -614,8 +592,33 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
                 }
             }
 
+            if let Err(e) = raft_router.significant_send(
+                region_id,
+                SignificantMsg::CaptureChange {
+                    cmd: change_cmd,
+                    region_epoch: request.take_region_epoch(),
+                    callback: Callback::Read(Box::new(move |resp| {
+                        info!("cdc init down stream"; "region_id" => region_id);
+                        if let Err(e) = scheduler.schedule(Task::InitDownstream {
+                            downstream_id,
+                            downstream_state,
+                            cb: Box::new(move || {
+                                cb(resp);
+                            }),
+                        }) {
+                            error!("schedule cdc task failed"; "error" => ?e);
+                        }
+                    })),
+                },
+            ) {
+                deregister_downstream(Error::Request(e.into()));
+                return;
+            }
+
             match fut.await {
-                Ok(resp) => init.on_change_cmd(resp).await,
+                Ok(resp) => {
+                    init.on_change_cmd(resp).await
+                },
                 Err(e) => deregister_downstream(Error::Other(box_err!(e))),
             }
         });
