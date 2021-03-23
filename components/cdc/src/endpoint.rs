@@ -159,6 +159,7 @@ pub enum Task {
     },
     TxnExtra(TxnExtra),
     Validate(u64, Box<dyn FnOnce(Option<&Delegate>) + Send>),
+    Barrier(Box<dyn FnOnce() + Send>),
 }
 
 impl_display_as_debug!(Task);
@@ -224,6 +225,7 @@ impl fmt::Debug for Task {
                 .finish(),
             Task::TxnExtra(_) => de.field("type", &"txn_extra").finish(),
             Task::Validate(region_id, _) => de.field("region_id", &region_id).finish(),
+            Task::Barrier(_) => de.field("type", &"barrier").finish(),
         }
     }
 }
@@ -442,6 +444,21 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
             let valid_regions =
                 Self::region_resolved_ts_raft(regions, &scheduler, raft_router, min_ts).await;
             if valid_regions.len() == 0 {
+                return None;
+            }
+
+            // send a barrier to the scheduler
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if let Err(e) = scheduler.schedule(Task::Barrier(Box::new(move || {
+                // TODO any risk with unwrap?
+                tx.send(()).unwrap();
+            }))) {
+                warn!("cdc send barrier failed"; "err" => ?e, "min_ts" => min_ts);
+                return None;
+            }
+
+            if let Err(e) = rx.await {
+                warn!("cdc barrier error"; "err" => ?e, "min_ts" => min_ts);
                 return None;
             }
 
@@ -1320,12 +1337,29 @@ impl Initializer {
             ..Default::default()
         };
 
-        self.downstream
+        let res = self.downstream
             .as_ref()
             .unwrap()
             .get_rate_limiter()
             .unwrap()
             .send_realtime_event(CdcEvent::ResolvedTs(resolved_ts));
+        match res {
+            Ok(_) => {},
+            Err(e) => {
+                error!("cdc incremental scan sending finish resolved ts failed"; "error" => ?e, "region_id" => region_id);
+                // TODO: record in metrics.
+                let deregister = Deregister::Downstream {
+                    region_id,
+                    downstream_id,
+                    conn_id,
+                    err: None, // TODO: convert rate_limiter error
+                };
+                if let Err(e) = self.sched.schedule(Task::Deregister(deregister)) {
+                    error!("schedule cdc task failed"; "error" => ?e, "region_id" => region_id);
+                }
+                return;
+            }
+        }
 
         // handle the case where the region has already deregistered
         {
@@ -1462,6 +1496,9 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Runnable for Endpoint<T> {
             }
             Task::Validate(region_id, validate) => {
                 validate(self.capture_regions.get(&region_id));
+            }
+            Task::Barrier(cb) => {
+                cb();
             }
         }
         self.flush_all();
