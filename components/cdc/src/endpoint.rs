@@ -1214,11 +1214,16 @@ impl Initializer {
             "downstream_id" => ?downstream_id,
             "observe_id" => ?self.observe_id);
 
+        /*
         let resolver = if self.build_resolver {
             Some(Resolver::new(region_id))
         } else {
             None
         };
+        */
+
+        /* We need a resolver to track locks encountered in the incremental scan */
+        let resolver = Some(Resolver::new(region_id));
 
         fail_point!("cdc_incremental_scan_start");
 
@@ -1334,9 +1339,14 @@ impl Initializer {
             }
         }
 
+        /* Now the resolver contains locks that remain unresolved after the scan. */
+        let resolver = scan_context.lock().unwrap().resolver.replace(None);
+        let min_lock_ts = resolver.as_ref().unwrap().min_lock_ts().unwrap_or(self.real_time_start_ts.unwrap());
+        let resolved_ts = std::cmp::min(self.real_time_start_ts.unwrap(), min_lock_ts);
+
         let resolved_ts = ResolvedTs {
             regions: vec![self.region_id],
-            ts: self.real_time_start_ts.unwrap().into_inner(),
+            ts: resolved_ts.into_inner(),
             ..Default::default()
         };
 
@@ -1384,9 +1394,14 @@ impl Initializer {
         }
 
         let takes = start.elapsed();
+        if self.build_resolver {
+            self.finish_building_resolver(resolver.unwrap(), region, takes);
+        }
+        /*
         if let Some(resolver) = scan_context.lock().unwrap().resolver.take() {
             self.finish_building_resolver(resolver, region, takes);
         }
+        */
         CDC_SCAN_DURATION_HISTOGRAM.observe(takes.as_secs_f64());
     }
 
