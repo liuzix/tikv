@@ -223,7 +223,7 @@ where
         // TODO find a way to determine the best number
         if this.buf.as_ref().unwrap().len() >= 32 {
             this.prepare_flush();
-            ready!(this.inner_sink.poll_flush_unpin(cx))?;
+            ready!(this.poll_flush_unpin(cx))?;
 
             assert!(this.buf.is_none());
             this.buf = Some(vec![]);
