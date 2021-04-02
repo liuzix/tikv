@@ -259,8 +259,8 @@ where
         }
 
         assert!(this.buf.is_none());
-
-        let flag = WriteFlags::default().buffer_hint(false);
+        this.is_flushing_inner = true;
+        let mut flag = WriteFlags::default().buffer_hint(true);
         while !this.send_buf.is_empty() {
             ready!(this.inner_sink.poll_ready_unpin(cx))?;
             let event = this.send_buf.pop_front().unwrap();
@@ -272,6 +272,9 @@ where
                 );
             }
 
+            if this.send_buf.is_empty() {
+                flag = flag.buffer_hint(false);
+            }
             this.inner_sink.start_send_unpin((event, flag))?;
         }
 
