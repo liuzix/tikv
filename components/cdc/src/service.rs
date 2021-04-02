@@ -221,9 +221,9 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        // We set the threshold to flush the inner_sink to 32
+        // We set the threshold to flush the inner_sink to 2
         // TODO find a way to determine the best number
-        if this.buf.as_ref().unwrap().len() >= 32 {
+        if this.buf.as_ref().unwrap().len() >= 2 {
             this.prepare_flush();
             ready!(this.poll_flush_unpin(cx))?;
 
