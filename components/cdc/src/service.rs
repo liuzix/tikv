@@ -166,6 +166,7 @@ where
     send_buf: VecDeque<ChangeDataEvent>,
     // the final downstream sink
     inner_sink: S,
+    is_flushing_inner: bool,
 }
 
 impl<S, E> EventBatcherSink<S, E>
@@ -177,6 +178,7 @@ where
             buf: None,
             send_buf: VecDeque::new(),
             inner_sink: sink,
+            is_flushing_inner: false,
         }
     }
 
@@ -210,7 +212,7 @@ where
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
 
-        if !this.send_buf.is_empty() {
+        if !this.send_buf.is_empty() || this.is_flushing_inner {
             ready!(this.poll_flush_unpin(cx))?;
         }
 
@@ -274,6 +276,7 @@ where
         }
 
         ready!(this.inner_sink.poll_flush_unpin(cx))?;
+        this.is_flushing_inner = false;
         Poll::Ready(Ok(()))
     }
 
