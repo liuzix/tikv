@@ -1245,6 +1245,7 @@ impl Initializer {
             // unlock incremental_scan_state
         }
 
+        CDC_SCAN_TASKS.inc();
         let mut done = false;
         while !done {
             if self.downstream_state.load() != DownstreamState::Normal {
@@ -1252,6 +1253,7 @@ impl Initializer {
                     "region_id" => region_id,
                     "downstream_id" => ?downstream_id,
                     "observe_id" => ?self.observe_id);
+                CDC_SCAN_TASKS.dec();
                 return;
             }
             let scan_context = scan_context.clone();
@@ -1272,6 +1274,7 @@ impl Initializer {
                     res
                 }
                 Err(e) => {
+                    CDC_SCAN_TASKS.dec();
                     error!("cdc async incremental scan batch failed"; "error" => ?e, "region_id" => region_id);
                     self.deregister_downstream(Some(e));
                     return;
@@ -1296,6 +1299,7 @@ impl Initializer {
                             debug!("cdc incremental scan sent data"; "num_entires" => num_entires)
                         }
                         Err(e) => {
+                            CDC_SCAN_TASKS.dec();
                             error!("cdc scan entries failed"; "error" => ?e, "region_id" => region_id);
                             // TODO: convert rate_limiter error
                             self.deregister_downstream(None);
@@ -1329,6 +1333,7 @@ impl Initializer {
             .get_rate_limiter()
             .unwrap()
             .send_realtime_event(CdcEvent::ResolvedTs(resolved_ts));
+        CDC_SCAN_TASKS.dec();
         match res {
             Ok(_) => {}
             Err(e) => {

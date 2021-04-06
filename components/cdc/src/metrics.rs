@@ -83,4 +83,15 @@ lazy_static! {
         "Resolved Ts advance method, 0 = advanced through raft command, 1 = advanced through store RPC"
     )
     .unwrap();
+    pub static ref CDC_SCAN_TASKS: IntGauge = register_int_gauge!(
+        "tikv_cdc_scan_tasks",
+        "Total number of CDC incremental scan tasks"
+    )
+    .unwrap();
+    pub static ref CDC_STREAM_EVENT_COUNT: IntCounterVec = register_int_counter_vec!(
+        "tikv_cdc_stream_event_count",
+        "The number of events sent by CDC streams",
+        &["conn", "tag"]
+    )
+    .unwrap();
 }

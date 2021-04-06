@@ -169,6 +169,8 @@ where
     state: EventBatcherSinkState,
     // the final downstream sink
     inner_sink: S,
+    // conn_id for metrics purposes
+    conn_id: Option<ConnID>,
 }
 
 impl<S, E> EventBatcherSink<S, E>
@@ -179,7 +181,12 @@ where
         Self {
             state: EventBatcherSinkState::Ready(Vec::new()),
             inner_sink: sink,
+            conn_id: None,
         }
+    }
+
+    pub fn set_conn_id(&mut self, conn_id: ConnID) {
+        self.conn_id = Some(conn_id);
     }
 
     /// converts all buffered CdcEvents into ChangeDataEvents.
@@ -282,9 +289,25 @@ where
                         );
                     }
 
+                    /*
                     if send_buf.is_empty() {
                         flag = flag.buffer_hint(false);
                     }
+                    */
+
+                    // write metrics only if there is a conn_id
+                    if let Some(conn_id) = this.conn_id.as_ref() {
+                        let conn_id_str = format!("{:?}", conn_id);
+                        let type_str = if event.get_events().len() > 0 {
+                            "events"
+                        } else {
+                            "resolved"
+                        };
+                        CDC_STREAM_EVENT_COUNT
+                            .with_label_values(&[conn_id_str.as_str(), type_str])
+                            .inc();
+                    }
+
                     this.inner_sink.start_send_unpin((event, flag))?;
                 }
 
@@ -536,7 +559,8 @@ impl ChangeData for Service {
         ctx.spawn(async move {
             // EventBatcherSink is used to pack CdcEvents into ChangeDataEvents.
             // Internally, EventBatcherSink composes a "inverted flat map" in front of the final sink.
-            let batched_sink = EventBatcherSink::new(&mut sink);
+            let mut batched_sink = EventBatcherSink::new(&mut sink);
+            batched_sink.set_conn_id(conn_id);
             // The drainer will block asynchronously, until
             // 1) all senders have exited,
             // 2) the grpc sink has been closed,
@@ -583,7 +607,7 @@ mod tests {
     use crate::service::{
         CdcEvent, EventBatcher, EventBatcherSink, CDC_EVENT_MAX_BATCH_SIZE, CDC_MAX_RESP_SIZE,
     };
-    use futures::{SinkExt, StreamExt, future::poll_fn};
+    use futures::{future::poll_fn, SinkExt, StreamExt};
     use std::time::Duration;
 
     #[tokio::test]
@@ -625,7 +649,9 @@ mod tests {
                 let mut resolved_ts = ResolvedTs::default();
                 resolved_ts.set_ts(i);
                 poll_fn(|cx| batch_sink.poll_ready_unpin(cx)).await.unwrap();
-                batch_sink.start_send_unpin((CdcEvent::ResolvedTs(resolved_ts), flag)).unwrap();
+                batch_sink
+                    .start_send_unpin((CdcEvent::ResolvedTs(resolved_ts), flag))
+                    .unwrap();
             }
             batch_sink.flush().await.unwrap();
         });
@@ -641,8 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_batcher_sink_poll_back_pressure() {
-        let (sink, mut rx) =
-            futures::channel::mpsc::channel(8);
+        let (sink, mut rx) = futures::channel::mpsc::channel(8);
         let mut batch_sink = EventBatcherSink::new(sink);
         let send_task = tokio::spawn(async move {
             let flag = grpcio::WriteFlags::default().buffer_hint(false);
@@ -650,7 +675,9 @@ mod tests {
                 let mut resolved_ts = ResolvedTs::default();
                 resolved_ts.set_ts(i);
                 poll_fn(|cx| batch_sink.poll_ready_unpin(cx)).await.unwrap();
-                batch_sink.start_send_unpin((CdcEvent::ResolvedTs(resolved_ts), flag)).unwrap();
+                batch_sink
+                    .start_send_unpin((CdcEvent::ResolvedTs(resolved_ts), flag))
+                    .unwrap();
             }
             batch_sink.flush().await.unwrap();
         });
@@ -664,7 +691,6 @@ mod tests {
         assert_eq!(expected, 1000);
         send_task.await.unwrap();
     }
-
 
     #[test]
     fn test_event_batcher() {
