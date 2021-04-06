@@ -225,15 +225,16 @@ where
                     this.prepare_flush();
                     ready!(this.poll_flush_unpin(cx))?;
                 }
-                Poll::Ready(Ok(()))
             }
             EventBatcherSinkState::Sending(_) => {
-                panic!("cdc unexpected poll_ready");
+                ready!(this.poll_flush_unpin(cx))?;
             }
             EventBatcherSinkState::Flushing => {
-                panic!("cdc unexpected poll_ready");
+                ready!(this.poll_flush_unpin(cx))?;
             }
         }
+
+        Poll::Ready(Ok(()))
     }
 
     /// Will always succeed as long as called correctly.
@@ -582,7 +583,8 @@ mod tests {
     use crate::service::{
         CdcEvent, EventBatcher, EventBatcherSink, CDC_EVENT_MAX_BATCH_SIZE, CDC_MAX_RESP_SIZE,
     };
-    use futures::{SinkExt, StreamExt};
+    use futures::{SinkExt, StreamExt, future::poll_fn};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_event_batcher_sink() {
@@ -600,6 +602,7 @@ mod tests {
                     .unwrap();
                 tokio::task::yield_now().await;
             }
+            batch_sink.flush().await.unwrap();
         });
 
         let mut expected = 0u64;
@@ -610,6 +613,58 @@ mod tests {
         assert_eq!(expected, 1000000);
         send_task.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_event_batcher_sink_poll_ready_wait() {
+        let (sink, mut rx) =
+            futures::channel::mpsc::unbounded::<(ChangeDataEvent, grpcio::WriteFlags)>();
+        let mut batch_sink = EventBatcherSink::new(sink);
+        let send_task = tokio::spawn(async move {
+            let flag = grpcio::WriteFlags::default().buffer_hint(false);
+            for i in 0..1000000u64 {
+                let mut resolved_ts = ResolvedTs::default();
+                resolved_ts.set_ts(i);
+                poll_fn(|cx| batch_sink.poll_ready_unpin(cx)).await.unwrap();
+                batch_sink.start_send_unpin((CdcEvent::ResolvedTs(resolved_ts), flag)).unwrap();
+            }
+            batch_sink.flush().await.unwrap();
+        });
+
+        let mut expected = 0u64;
+        while let Some((e, _)) = rx.next().await {
+            assert_eq!(e.get_resolved_ts().get_ts(), expected);
+            expected += 1;
+        }
+        assert_eq!(expected, 1000000);
+        send_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_event_batcher_sink_poll_back_pressure() {
+        let (sink, mut rx) =
+            futures::channel::mpsc::channel(8);
+        let mut batch_sink = EventBatcherSink::new(sink);
+        let send_task = tokio::spawn(async move {
+            let flag = grpcio::WriteFlags::default().buffer_hint(false);
+            for i in 0..1000u64 {
+                let mut resolved_ts = ResolvedTs::default();
+                resolved_ts.set_ts(i);
+                poll_fn(|cx| batch_sink.poll_ready_unpin(cx)).await.unwrap();
+                batch_sink.start_send_unpin((CdcEvent::ResolvedTs(resolved_ts), flag)).unwrap();
+            }
+            batch_sink.flush().await.unwrap();
+        });
+
+        let mut expected = 0u64;
+        while let Some((e, _)) = rx.next().await {
+            assert_eq!(e.get_resolved_ts().get_ts(), expected);
+            expected += 1;
+            tokio::time::delay_for(Duration::from_millis(1)).await;
+        }
+        assert_eq!(expected, 1000);
+        send_task.await.unwrap();
+    }
+
 
     #[test]
     fn test_event_batcher() {
