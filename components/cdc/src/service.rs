@@ -30,7 +30,6 @@ use kvproto::cdcpb::event::Event as Event_oneof_event;
 use kvproto::cdcpb::Event_oneof_event;
 use std::collections::VecDeque;
 use std::pin::Pin;
-
 static CONNECTION_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
 
 const CDC_MAX_RESP_SIZE: u32 = 6 * 1024 * 1024; // 6MB
@@ -156,17 +155,20 @@ impl EventBatcher {
     }
 }
 
+enum EventBatcherSinkState {
+    Ready(Vec<CdcEvent>),
+    Sending(VecDeque<ChangeDataEvent>),
+    Flushing,
+}
+
 pub struct EventBatcherSink<S, E>
 where
     S: Sink<(ChangeDataEvent, grpcio::WriteFlags), Error = E> + Send + Unpin,
 {
-    // buf stores events just received.
-    buf: Option<Vec<CdcEvent>>,
-    // a queue for protobuf events ready to send out.
-    send_buf: VecDeque<ChangeDataEvent>,
+    // the internal state machine of this sink
+    state: EventBatcherSinkState,
     // the final downstream sink
     inner_sink: S,
-    is_flushing_inner: bool,
 }
 
 impl<S, E> EventBatcherSink<S, E>
@@ -175,28 +177,33 @@ where
 {
     pub fn new(sink: S) -> Self {
         Self {
-            buf: None,
-            send_buf: VecDeque::new(),
+            state: EventBatcherSinkState::Ready(Vec::new()),
             inner_sink: sink,
-            is_flushing_inner: false,
         }
     }
 
     /// converts all buffered CdcEvents into ChangeDataEvents.
-    /// consumes `buf`
     fn prepare_flush(&mut self) {
-        assert!(self.buf.is_some());
+        let old_state = std::mem::replace(
+            &mut self.state,
+            EventBatcherSinkState::Sending(VecDeque::new()),
+        );
+        if let EventBatcherSinkState::Ready(buf) = old_state {
+            let mut batcher = EventBatcher::with_capacity(CDC_EVENT_MAX_BATCH_SIZE);
+            buf.into_iter().for_each(|event| batcher.push(event));
 
-        let mut batcher = EventBatcher::with_capacity(CDC_EVENT_MAX_BATCH_SIZE);
-        self.buf
-            .take()
-            .unwrap()
-            .into_iter()
-            .for_each(|event| batcher.push(event));
-        batcher
-            .build()
-            .into_iter()
-            .for_each(|event| self.send_buf.push_back(event));
+            match self.state {
+                EventBatcherSinkState::Sending(ref mut send_buf) => {
+                    batcher
+                        .build()
+                        .into_iter()
+                        .for_each(|event| send_buf.push_back(event));
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            panic!("cdc unexpected EventBatcherSinkState");
+        }
     }
 }
 
@@ -212,37 +219,38 @@ where
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
 
-        if !this.send_buf.is_empty() || this.is_flushing_inner {
-            ready!(this.poll_flush_unpin(cx))?;
+        match this.state {
+            EventBatcherSinkState::Ready(ref buf) => {
+                if buf.len() >= 4 {
+                    this.prepare_flush();
+                    ready!(this.poll_flush_unpin(cx))?;
+                }
+                Poll::Ready(Ok(()))
+            }
+            EventBatcherSinkState::Sending(_) => {
+                panic!("cdc unexpected poll_ready");
+            }
+            EventBatcherSinkState::Flushing => {
+                panic!("cdc unexpected poll_ready");
+            }
         }
-
-        if this.buf.is_none() {
-            this.buf = Some(vec![]);
-            return Poll::Ready(Ok(()));
-        }
-
-        // We set the threshold to flush the inner_sink to 2
-        // TODO find a way to determine the best number
-        if this.buf.as_ref().unwrap().len() >= 2 {
-            this.prepare_flush();
-            ready!(this.poll_flush_unpin(cx))?;
-
-            assert!(this.buf.is_none());
-            this.buf = Some(vec![]);
-            return Poll::Ready(Ok(()));
-        }
-
-        Poll::Ready(Ok(()))
     }
 
     /// Will always succeed as long as called correctly.
     fn start_send(self: Pin<&mut Self>, item: (CdcEvent, WriteFlags)) -> Result<(), Self::Error> {
         let this = self.get_mut();
-        assert!(this.buf.is_some());
-
-        let (event, _) = item;
-        this.buf.as_mut().unwrap().push(event);
-        Ok(())
+        match this.state {
+            EventBatcherSinkState::Ready(ref mut buf) => {
+                buf.push(item.0);
+                Ok(())
+            }
+            EventBatcherSinkState::Sending(_) => {
+                panic!("cdc unexpected start_send");
+            }
+            EventBatcherSinkState::Flushing => {
+                panic!("cdc unexpected start_send");
+            }
+        }
     }
 
     /// Converts any CdcEvents in `buf` to ChangeDataEvents,
@@ -254,32 +262,41 @@ where
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
 
-        if this.buf.is_some() {
-            this.prepare_flush();
+        match this.state {
+            EventBatcherSinkState::Ready(_) => {
+                this.prepare_flush();
+                ready!(this.poll_flush_unpin(cx))?;
+            }
+            EventBatcherSinkState::Sending(ref mut send_buf) => {
+                let mut flag = WriteFlags::default().buffer_hint(true);
+                while !send_buf.is_empty() {
+                    ready!(this.inner_sink.poll_ready_unpin(cx))?;
+                    let event = send_buf.pop_front().unwrap();
+
+                    let latest_resolved_ts = event.get_resolved_ts().get_ts();
+                    if latest_resolved_ts > 0 {
+                        CDC_GRPC_WRITE_RESOLVED_TS.set(
+                            txn_types::TimeStamp::new(event.get_resolved_ts().get_ts()).physical()
+                                as i64,
+                        );
+                    }
+
+                    if send_buf.is_empty() {
+                        flag = flag.buffer_hint(false);
+                    }
+                    this.inner_sink.start_send_unpin((event, flag))?;
+                }
+
+                this.state = EventBatcherSinkState::Flushing;
+                ready!(this.inner_sink.poll_flush_unpin(cx))?;
+                this.state = EventBatcherSinkState::Ready(Vec::new());
+            }
+            EventBatcherSinkState::Flushing => {
+                ready!(this.inner_sink.poll_flush_unpin(cx))?;
+                this.state = EventBatcherSinkState::Ready(Vec::new());
+            }
         }
 
-        assert!(this.buf.is_none());
-        this.is_flushing_inner = true;
-        let mut flag = WriteFlags::default().buffer_hint(true);
-        while !this.send_buf.is_empty() {
-            ready!(this.inner_sink.poll_ready_unpin(cx))?;
-            let event = this.send_buf.pop_front().unwrap();
-
-            let latest_resolved_ts = event.get_resolved_ts().get_ts();
-            if latest_resolved_ts > 0 {
-                CDC_GRPC_WRITE_RESOLVED_TS.set(
-                    txn_types::TimeStamp::new(event.get_resolved_ts().get_ts()).physical() as i64,
-                );
-            }
-
-            if this.send_buf.is_empty() {
-                flag = flag.buffer_hint(false);
-            }
-            this.inner_sink.start_send_unpin((event, flag))?;
-        }
-
-        ready!(this.inner_sink.poll_flush_unpin(cx))?;
-        this.is_flushing_inner = false;
         Poll::Ready(Ok(()))
     }
 
@@ -574,7 +591,7 @@ mod tests {
         let mut batch_sink = EventBatcherSink::new(sink);
         let send_task = tokio::spawn(async move {
             let flag = grpcio::WriteFlags::default().buffer_hint(false);
-            for i in 0..100000u64 {
+            for i in 0..1000000u64 {
                 let mut resolved_ts = ResolvedTs::default();
                 resolved_ts.set_ts(i);
                 batch_sink
@@ -590,7 +607,7 @@ mod tests {
             assert_eq!(e.get_resolved_ts().get_ts(), expected);
             expected += 1;
         }
-        assert_eq!(expected, 100000);
+        assert_eq!(expected, 1000000);
         send_task.await.unwrap();
     }
 
