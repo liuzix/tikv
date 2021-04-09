@@ -239,7 +239,7 @@ where
 
         match this.state {
             EventBatcherSinkState::Ready(ref buf) => {
-                if buf.len() >= 1 {
+                if buf.len() >= 2 {
                     // converts CdcEvent to ChangeDataEvent
                     this.prepare_flush();
                     ready!(this.poll_flush_unpin(cx))?;
@@ -314,7 +314,7 @@ where
                     // write metrics only if there is a conn_id
                     if let Some(conn_id) = this.conn_id.as_ref() {
                         let conn_id_str = format!("{:?}", conn_id);
-                        let type_str = if event.get_events().len() > 0 {
+                        let type_str = if !event.get_events().is_empty() {
                             "events"
                         } else {
                             "resolved"
@@ -324,7 +324,7 @@ where
                             .inc();
                     }
 
-                    println!("cdc send data {:?}", event);
+                    // println!("cdc send data {:?}", event);
                     this.inner_sink.start_send_unpin((event, flag))?;
                 }
 
@@ -370,7 +370,7 @@ where
             }
         }
 
-        return Poll::Ready(Ok(()));
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -536,10 +536,10 @@ impl ChangeData for Service {
 
         let cancel_flusher = Arc::new(AtomicBool::new(false));
         let cancel_flusher_clone = cancel_flusher.clone();
-        let handle = self.runtime.spawn(async move {
+        let flusher_handle = self.runtime.spawn(async move {
             while !cancel_flusher.load(Ordering::SeqCst) {
+                tokio::time::delay_for(Duration::from_millis(2000)).await;
                 rate_limiter_clone.start_flush();
-                tokio::time::delay_for(Duration::from_millis(200)).await;
             }
         });
 
@@ -649,13 +649,15 @@ impl ChangeData for Service {
                     }
                 }
             }
-            cancel_flusher_clone.store(true, Ordering::SeqCst);
+
             // Unregister this downstream only.
             let deregister = Deregister::Conn(conn_id);
             if let Err(e) = scheduler.schedule(Task::Deregister(deregister)) {
                 error!("cdc deregister failed"; "error" => ?e);
             }
 
+            cancel_flusher_clone.store(true, Ordering::SeqCst);
+            let _ = flusher_handle.await.unwrap();
             info!("cdc send closed"; "downstream" => peer.clone(), "conn_id" => ?conn_id);
         });
     }

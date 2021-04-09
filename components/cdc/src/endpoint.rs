@@ -423,13 +423,11 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
     fn get_current_resolved_ts(
         &self,
         region_id: u64,
-        observer_id: ObserveID,
-    ) -> impl Future<Output = Option<TimeStamp>> {
+        _observer_id: ObserveID,
+    ) -> impl Future<Output = Result<TimeStamp>> {
         let pd_client = self.pd_client.clone();
         let cm = self.concurrency_manager.clone();
         let raft_router = self.raft_router.clone();
-        let scheduler = self.scheduler.clone();
-        let regions = vec![(region_id, observer_id)];
 
         async move {
             let mut min_ts = pd_client.get_tso().await.unwrap_or_default();
@@ -442,13 +440,26 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
                 }
             }
 
-            let valid_regions =
-                Self::region_resolved_ts_raft(regions, &scheduler, raft_router, min_ts).await;
-            if valid_regions.is_empty() {
-                return None;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if let Err(e) = raft_router.significant_send(
+                region_id,
+                SignificantMsg::LeaderCallback(Callback::Read(Box::new(move |resp| {
+                    let resp = if resp.response.get_header().has_error() {
+                        Err(Error::Request(
+                            resp.response.get_header().get_error().clone(),
+                        ))
+                    } else {
+                        Ok(())
+                    };
+                    if tx.send(resp).is_err() {
+                        error!("cdc send tso response failed"; "region_id" => region_id);
+                    }
+                }))),
+            ) {
+                return Err(Error::Other(e.into()));
             }
-
-            Some(min_ts)
+            rx.await.unwrap_or(Err(Error::GetRealTimeStartFailed))?;
+            Ok(min_ts)
         }
     }
 
@@ -495,7 +506,6 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
         let mut is_new_delegate = false;
         let delegate = self.capture_regions.entry(region_id).or_insert_with(|| {
             let d = Delegate::new(region_id);
-            println!("cdc new delegate");
             is_new_delegate = true;
             d
         });
@@ -561,7 +571,6 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
         let (cb, fut) = tikv_util::future::paired_future_callback();
         let scheduler = self.scheduler.clone();
         let deregister_downstream = move |err| {
-            println!("cdc deregister {:?}", err);
             let deregister = if is_new_delegate {
                 Deregister::Region {
                     region_id,
@@ -586,13 +595,13 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
         self.workers.spawn(async move {
             if advanced_flow_control_enabled {
                 match get_current_resolved_ts_fut.await {
-                    Some(ts) => {
+                    Ok(ts) => {
                         init.real_time_start_ts = Some(ts);
                         info!("cdc got real time start ts"; "region_id" => region_id, "start_ts" => ?ts);
                     },
-                    None => {
-                        info!("cdc failed to get real time start ts"; "region_id" => region_id);
-                        deregister_downstream(Error::GetRealTimeStartFailed);
+                    Err(e) => {
+                        info!("cdc failed to get real time start ts"; "region_id" => region_id, "error" => ?e);
+                        deregister_downstream(e);
                         return;
                     }
                 }
@@ -1154,6 +1163,8 @@ impl Initializer {
                     "region_id" => region_id,
                     "downstream_id" => ?downstream_id,
                     "observe_id" => ?self.observe_id);
+
+                self.deregister_downstream(None);
                 return;
             }
             let entries = match Self::scan_batch(&mut scanner, self.batch_size, resolver.as_mut()) {
@@ -1256,6 +1267,7 @@ impl Initializer {
                     "downstream_id" => ?downstream_id,
                     "observe_id" => ?self.observe_id);
                 CDC_SCAN_TASKS.dec();
+                self.deregister_downstream(None);
                 return;
             }
             let scan_context = scan_context.clone();
