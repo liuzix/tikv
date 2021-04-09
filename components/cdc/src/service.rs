@@ -2,7 +2,7 @@
 
 use std::collections::hash_map::Entry;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use collections::HashMap;
 use futures::future::{self, TryFutureExt};
@@ -30,6 +30,9 @@ use kvproto::cdcpb::event::Event as Event_oneof_event;
 use kvproto::cdcpb::Event_oneof_event;
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
 static CONNECTION_ID_ALLOC: AtomicUsize = AtomicUsize::new(0);
 
 const CDC_MAX_RESP_SIZE: u32 = 6 * 1024 * 1024; // 6MB
@@ -155,10 +158,16 @@ impl EventBatcher {
     }
 }
 
+/// represents the state machine used internally in EventBatcherSink
 enum EventBatcherSinkState {
+    // Ready to receive new data
     Ready(Vec<CdcEvent>),
+    // In the process of sending a batch of assembled ChangeDataEvent
     Sending(VecDeque<ChangeDataEvent>),
+    // Flushing the inner sink after Sending
     Flushing,
+    // Closing down the sink
+    Closing,
 }
 
 pub struct EventBatcherSink<S, E>
@@ -220,15 +229,18 @@ where
 {
     type Error = E;
 
-    /// Will block the task if:
-    /// 1) there are ChangeDataEvents not sent out, or buf` has at least 1024 messages,
-    /// and 2) they cannot be successfully flushed down the `inner_sink` immediately.
+    /// returns Ready if and only if (1) the state machine is in Ready state, and (2)
+    /// there are not so many CdcEvents in the buffer.
+    /// If (1) is not satisfied, it means that this is NOT the first poll to this function in preparation to
+    /// start_send, so there must be the result of the task being awaken by a block in poll_flush, so we call
+    /// poll_flush.
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
 
         match this.state {
             EventBatcherSinkState::Ready(ref buf) => {
-                if buf.len() >= 4 {
+                if buf.len() >= 1 {
+                    // converts CdcEvent to ChangeDataEvent
                     this.prepare_flush();
                     ready!(this.poll_flush_unpin(cx))?;
                 }
@@ -238,6 +250,9 @@ where
             }
             EventBatcherSinkState::Flushing => {
                 ready!(this.poll_flush_unpin(cx))?;
+            }
+            EventBatcherSinkState::Closing => {
+                panic!("sink is closing");
             }
         }
 
@@ -257,6 +272,9 @@ where
             }
             EventBatcherSinkState::Flushing => {
                 panic!("cdc unexpected start_send");
+            }
+            EventBatcherSinkState::Closing => {
+                panic!("sink is closing");
             }
         }
     }
@@ -289,11 +307,9 @@ where
                         );
                     }
 
-                    /*
                     if send_buf.is_empty() {
                         flag = flag.buffer_hint(false);
                     }
-                    */
 
                     // write metrics only if there is a conn_id
                     if let Some(conn_id) = this.conn_id.as_ref() {
@@ -308,6 +324,7 @@ where
                             .inc();
                     }
 
+                    println!("cdc send data {:?}", event);
                     this.inner_sink.start_send_unpin((event, flag))?;
                 }
 
@@ -319,6 +336,9 @@ where
                 ready!(this.inner_sink.poll_flush_unpin(cx))?;
                 this.state = EventBatcherSinkState::Ready(Vec::new());
             }
+            EventBatcherSinkState::Closing => {
+                panic!("sink is closing");
+            }
         }
 
         Poll::Ready(Ok(()))
@@ -327,7 +347,30 @@ where
     /// Closes the underlying `inner_sink`.
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-        this.inner_sink.poll_close_unpin(cx)
+
+        match this.state {
+            EventBatcherSinkState::Ready(_) => {
+                this.prepare_flush();
+                ready!(this.poll_flush_unpin(cx))?;
+                this.state = EventBatcherSinkState::Closing;
+                ready!(this.inner_sink.poll_close_unpin(cx))?;
+            }
+            EventBatcherSinkState::Sending(_) => {
+                ready!(this.poll_flush_unpin(cx))?;
+                this.state = EventBatcherSinkState::Closing;
+                ready!(this.inner_sink.poll_close_unpin(cx))?;
+            }
+            EventBatcherSinkState::Flushing => {
+                ready!(this.poll_flush_unpin(cx))?;
+                this.state = EventBatcherSinkState::Closing;
+                ready!(this.inner_sink.poll_close_unpin(cx))?;
+            }
+            EventBatcherSinkState::Closing => {
+                ready!(this.inner_sink.poll_close_unpin(cx))?;
+            }
+        }
+
+        return Poll::Ready(Ok(()));
     }
 }
 
@@ -454,7 +497,7 @@ pub struct Service {
     scheduler: Scheduler<Task>,
     // We are using a tokio runtime because there are some futures that require a timer,
     // and the tokio library provides a good implementation for using timers with futures.
-    // runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl Service {
@@ -462,7 +505,17 @@ impl Service {
     ///
     /// It requires a scheduler of an `Endpoint` in order to schedule tasks.
     pub fn new(scheduler: Scheduler<Task>) -> Service {
-        Service { scheduler }
+        let worker = tokio::runtime::Builder::new()
+            .threaded_scheduler()
+            .core_threads(1)
+            .thread_name("cdc_flusher")
+            .enable_time()
+            .build()
+            .unwrap();
+        Service {
+            scheduler,
+            runtime: Arc::new(worker),
+        }
     }
 }
 
@@ -476,9 +529,19 @@ impl ChangeData for Service {
         // TODO determine the right values
         // 2048 is perfect fine with batching resolved-ts enabled.
         let (rate_limiter, drainer) = new_pair::<CdcEvent>(128, 2048);
+        let rate_limiter_clone = rate_limiter.clone();
         let peer = ctx.peer();
         let conn = Conn::new(rate_limiter, peer.clone());
         let conn_id = conn.get_id();
+
+        let cancel_flusher = Arc::new(AtomicBool::new(false));
+        let cancel_flusher_clone = cancel_flusher.clone();
+        let handle = self.runtime.spawn(async move {
+            while !cancel_flusher.load(Ordering::SeqCst) {
+                rate_limiter_clone.start_flush();
+                tokio::time::delay_for(Duration::from_millis(200)).await;
+            }
+        });
 
         debug!("cdc streaming request accepted"; "peer" => ?peer, "conn_id" => ?conn_id);
         if let Err(status) = self
@@ -567,22 +630,26 @@ impl ChangeData for Service {
             // 3) an error has occurred in the grpc sink,
             // or 4) the sink has been forced to close due to a congestion.
             let drain_res = drainer.drain(
-                batched_sink,
+                &mut batched_sink,
                 // We disable buffering in the grpc library
                 WriteFlags::default().buffer_hint(false)
             ).await;
             match drain_res {
                 Ok(_) => {
                     info!("cdc drainer exit"; "downstream" => peer.clone(), "conn_id" => ?conn_id);
-                    let _ = sink.fail(RpcStatus::new(RpcStatusCode::CANCELLED, Some("upstreams closed".into()))).await;
+                    batched_sink.close().await.unwrap();
                 },
                 Err(e) => {
                     error!("cdc drainer exit"; "downstream" => peer.clone(), "conn_id" => ?conn_id, "error" => ?e);
                     if let DrainerError::RateLimitExceededError = e {
-                        let _ = sink.fail(RpcStatus::new(RpcStatusCode::CANCELLED, Some("stream congested".into()))).await;
+                        batched_sink.close().await.unwrap();
+                    } else {
+                        // ignore any error returned by `fail`
+                        let _ = sink.fail(RpcStatus::new(RpcStatusCode::ABORTED, Some(format!("{:?}", e)))).await;
                     }
                 }
             }
+            cancel_flusher_clone.store(true, Ordering::SeqCst);
             // Unregister this downstream only.
             let deregister = Deregister::Conn(conn_id);
             if let Err(e) = scheduler.schedule(Task::Deregister(deregister)) {

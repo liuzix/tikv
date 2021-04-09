@@ -495,6 +495,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
         let mut is_new_delegate = false;
         let delegate = self.capture_regions.entry(region_id).or_insert_with(|| {
             let d = Delegate::new(region_id);
+            println!("cdc new delegate");
             is_new_delegate = true;
             d
         });
@@ -560,6 +561,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
         let (cb, fut) = tikv_util::future::paired_future_callback();
         let scheduler = self.scheduler.clone();
         let deregister_downstream = move |err| {
+            println!("cdc deregister {:?}", err);
             let deregister = if is_new_delegate {
                 Deregister::Region {
                     region_id,

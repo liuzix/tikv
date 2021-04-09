@@ -1389,6 +1389,7 @@ fn test_cdc_extract_rollback_if_gc_fence_set() {
         .into_iter()
         .for_each(|e| match e.event.unwrap() {
             Event_oneof_event::Entries(es) => {
+                println!("cdc test received event {:?}", es);
                 assert!(es.entries.len() == 1, "{:?}", es);
                 let e = &es.entries[0];
                 assert_eq!(e.get_type(), EventLogType::Initialized, "{:?}", es);
@@ -1424,11 +1425,15 @@ fn test_cdc_extract_rollback_if_gc_fence_set() {
     // too complicated to check them. Just skip them here, and wait for resolved_ts to be pushed to
     // a greater value than the two versions' commit_ts-es.
     let skip_to_ts = block_on(suite.cluster.pd_client.get_tso()).unwrap();
+    println!("skip_to_ts: {:?}", skip_to_ts);
     loop {
         let e = receive_event(true);
+        println!("cdc test received event {:?}", e);
         if let Some(r) = e.resolved_ts.as_ref() {
             if r.ts > skip_to_ts.into_inner() {
                 break;
+            } else {
+                println!("{:?}", e);
             }
         }
     }

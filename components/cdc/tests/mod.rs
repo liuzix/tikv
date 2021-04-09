@@ -188,7 +188,7 @@ impl TestSuite {
             ..Default::default()
         };
         req.set_region_epoch(self.get_context(region_id).take_region_epoch());
-        req.mut_header().set_ticdc_version("4.0.7".into());
+        req.mut_header().set_ticdc_version("5.0.0".into());
         req
     }
 
