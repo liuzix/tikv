@@ -641,12 +641,7 @@ impl ChangeData for Service {
                 },
                 Err(e) => {
                     error!("cdc drainer exit"; "downstream" => peer.clone(), "conn_id" => ?conn_id, "error" => ?e);
-                    if let DrainerError::RateLimitExceededError = e {
-                        batched_sink.close().await.unwrap();
-                    } else {
-                        // ignore any error returned by `fail`
-                        let _ = sink.fail(RpcStatus::new(RpcStatusCode::ABORTED, Some(format!("{:?}", e)))).await;
-                    }
+                    let _ = sink.fail(RpcStatus::new(RpcStatusCode::ABORTED, Some(format!("{:?}", e)))).await;
                 }
             }
 

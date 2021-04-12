@@ -418,6 +418,10 @@ impl<E> Drainer<E> {
         let mut unflushed_size: usize = 0;
         let mut last_flushed_time = std::time::Instant::now();
         loop {
+            fail_point!("cdc_inject_congestion", |_| {
+                Err(DrainerError::RateLimitExceededError)
+            });
+
             let mut sink_ready = poll_fn(|cx| rpc_sink.poll_ready_unpin(cx)).fuse();
 
             select! {
