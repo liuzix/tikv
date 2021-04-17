@@ -5,6 +5,7 @@
 
 mod test_endpoint;
 mod test_observe;
+mod test_rate_limiter;
 mod test_register;
 mod test_resolve;
 

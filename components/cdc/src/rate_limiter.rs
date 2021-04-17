@@ -333,7 +333,7 @@ where
                     .state
                     .blocked_sender_count
                     .fetch_sub(1, Ordering::SeqCst);
-                debug_assert!(prev_count > 0, "prev_count = {}", prev_count);
+                assert!(prev_count > 0, "prev_count = {}", prev_count);
             }
         }
     }
@@ -383,6 +383,9 @@ where
                 // This is the first time we have been polled and we decide to block.
                 let waker_arc = Arc::new(Mutex::new(Some(cx.waker().clone())));
                 queue.push(waker_arc.clone());
+
+                fail_point!("cdc_rate_limiter_scan_prepare_to_block");
+
                 let mut mut_self = self.get_mut();
                 mut_self.waker = Some(waker_arc);
 
@@ -428,12 +431,14 @@ impl<E> Drainer<E> {
                 ready = sink_ready => {
                     ready.map_err(|err| {
                         self.state.wake_up_all_senders();
+                        fail_point!("cdc_rate_limiter_on_drainer_error");
                         DrainerError::RpcSinkError(err)
                     })?;
                 },
                 item = close_rx.next() => {
                     if item.is_some() {
                         self.state.wake_up_all_senders();
+                        fail_point!("cdc_rate_limiter_on_drainer_error");
                         return Err(DrainerError::RateLimitExceededError);
                     }
                     return Ok(())
@@ -452,6 +457,7 @@ impl<E> Drainer<E> {
                             rpc_sink.start_send_unpin((v, flag))
                                 .map_err(|err| {
                                     self.state.wake_up_all_senders();
+                                    fail_point!("cdc_rate_limiter_on_drainer_error");
                                     DrainerError::RpcSinkError(err)
                                 })?;
 
@@ -460,6 +466,7 @@ impl<E> Drainer<E> {
                                 || std::time::Instant::now().duration_since(last_flushed_time) > Duration::from_millis(200) {
                                 rpc_sink.flush().await.map_err(|err| {
                                     self.state.wake_up_all_senders();
+                                    fail_point!("cdc_rate_limiter_on_drainer_error");
                                     DrainerError::RpcSinkError(err)
                                 })?;
                                 unflushed_size = 0;
@@ -469,6 +476,7 @@ impl<E> Drainer<E> {
                         DrainOneResult::FlushRequest => {
                             rpc_sink.flush().await.map_err(|err| {
                                 self.state.wake_up_all_senders();
+                                fail_point!("cdc_rate_limiter_on_drainer_error");
                                 DrainerError::RpcSinkError(err)
                             })?;
                             unflushed_size = 0;
@@ -489,6 +497,7 @@ impl<E> Drainer<E> {
                 item = close_rx.next() => {
                     if item.is_some() {
                         self.state.wake_up_all_senders();
+                        fail_point!("cdc_rate_limiter_on_drainer_error");
                         return Err(DrainerError::RateLimitExceededError);
                     }
                     return Ok(())
@@ -564,6 +573,153 @@ pub mod testing_util {
     use std::cell::RefCell;
     use tokio::time::timeout;
     use tokio::{runtime::Runtime, time::Elapsed};
+
+    pub type MockCdcEvent = u64;
+    /// MockWriteFlag is used to mock grpcio::WriteFlags,
+    /// which is required for writing into the grpc stream sink (grpcio::DuplexSink).
+    pub type MockWriteFlag = ();
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum MockRpcError {
+        SinkClosed,
+        InjectedRpcError,
+    }
+
+    /// MockRpcSink is a mock for grpcio::DuplexSink.
+    /// It has an internal buffer of size 1.
+    #[derive(Clone)]
+    pub struct MockRpcSink {
+        // the internal buffer. It has only one slot.
+        value: Arc<Mutex<Option<MockCdcEvent>>>,
+        send_waker: Arc<AtomicWaker>,
+        recv_waker: Arc<AtomicWaker>,
+        injected_send_error: Arc<Mutex<Option<MockRpcError>>>,
+        sink_closed: Arc<AtomicBool>,
+    }
+
+    /// MockRpcSinkBlockRecv is an auxiliary data structure for implementing
+    /// MockRpcSink::recv.
+    struct MockRpcSinkBlockRecv<'a, Cond>
+        where
+            Cond: Fn() -> bool + 'a,
+    {
+        sink: &'a MockRpcSink,
+        cond: Cond,
+    }
+
+    impl<'a, Cond> MockRpcSinkBlockRecv<'a, Cond>
+        where
+            Cond: Fn() -> bool + 'a,
+    {
+        fn new(sink: &'a MockRpcSink, cond: Cond) -> Self {
+            Self { sink, cond }
+        }
+    }
+
+    impl<'a, Cond> Future for MockRpcSinkBlockRecv<'a, Cond>
+        where
+            Cond: Fn() -> bool + 'a,
+    {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if !(self.cond)() {
+                Poll::Ready(())
+            } else {
+                self.sink.recv_waker.register(cx.waker());
+                if !(self.cond)() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    impl MockRpcSink {
+        pub fn new() -> MockRpcSink {
+            MockRpcSink {
+                value: Arc::new(Mutex::new(None)),
+                send_waker: Arc::new(AtomicWaker::new()),
+                recv_waker: Arc::new(AtomicWaker::new()),
+                injected_send_error: Arc::new(Mutex::new(None)),
+                sink_closed: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        pub async fn recv(&self) -> Option<MockCdcEvent> {
+            let value_clone = self.value.clone();
+            MockRpcSinkBlockRecv::new(self, move || {
+                value_clone.lock().unwrap().is_none() && !self.sink_closed.load(Ordering::SeqCst)
+            })
+                .await;
+
+            let ret = self.value.lock().unwrap().take();
+            self.send_waker.wake();
+            ret
+        }
+
+        pub fn inject_send_error(&self, err: MockRpcError) {
+            *self.injected_send_error.lock().unwrap() = Some(err);
+            self.send_waker.wake();
+        }
+    }
+
+    impl Sink<(MockCdcEvent, MockWriteFlag)> for MockRpcSink {
+        type Error = MockRpcError;
+
+        fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            if self.sink_closed.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(MockRpcError::SinkClosed));
+            }
+            if let Some(err) = self.injected_send_error.lock().unwrap().take() {
+                return Poll::Ready(Err(err));
+            }
+            let value_guard = self.value.lock().unwrap();
+            if value_guard.is_none() {
+                Poll::Ready(Ok(()))
+            } else {
+                self.send_waker.register(cx.waker());
+                Poll::Pending
+            }
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: (u64, MockWriteFlag)) -> Result<(), Self::Error> {
+            if self.sink_closed.load(Ordering::SeqCst) {
+                return Err(MockRpcError::SinkClosed);
+            }
+            if let Some(err) = self.injected_send_error.lock().unwrap().take() {
+                return Err(err);
+            }
+            let (value, _) = item;
+            *self.value.lock().unwrap() = Some(value);
+            self.recv_waker.wake();
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if let Some(err) = self.injected_send_error.lock().unwrap().take() {
+                return Poll::Ready(Err(err));
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if let Some(err) = self.injected_send_error.lock().unwrap().take() {
+                return Poll::Ready(Err(err));
+            }
+            self.sink_closed.store(true, Ordering::SeqCst);
+            self.recv_waker.wake();
+            Poll::Ready(Ok(()))
+        }
+    }
+
     pub struct TestingHarness {
         rx: Option<Receiver<(ChangeDataEvent, grpcio::WriteFlags)>>,
         rate_limiter: RateLimiter<CdcEvent>,
@@ -637,155 +793,13 @@ pub mod testing_util {
 }
 
 #[cfg(test)]
+pub use testing_util::MockRpcSink;
+
+#[cfg(test)]
 mod tests {
+    use super::testing_util::*;
     use super::*;
     use std::sync::Mutex;
-
-    type MockCdcEvent = u64;
-    /// MockWriteFlag is used to mock grpcio::WriteFlags,
-    /// which is required for writing into the grpc stream sink (grpcio::DuplexSink).
-    type MockWriteFlag = ();
-
-    #[derive(Debug, PartialEq, Eq)]
-    enum MockRpcError {
-        SinkClosed,
-        InjectedRpcError,
-    }
-
-    /// MockRpcSink is a mock for grpcio::DuplexSink.
-    /// It has an internal buffer of size 1.
-    #[derive(Clone)]
-    struct MockRpcSink {
-        // the internal buffer. It has only one slot.
-        value: Arc<Mutex<Option<MockCdcEvent>>>,
-        send_waker: Arc<AtomicWaker>,
-        recv_waker: Arc<AtomicWaker>,
-        injected_send_error: Arc<Mutex<Option<MockRpcError>>>,
-        sink_closed: Arc<AtomicBool>,
-    }
-
-    /// MockRpcSinkBlockRecv is an auxiliary data structure for implementing
-    /// MockRpcSink::recv.
-    struct MockRpcSinkBlockRecv<'a, Cond>
-    where
-        Cond: Fn() -> bool + 'a,
-    {
-        sink: &'a MockRpcSink,
-        cond: Cond,
-    }
-
-    impl<'a, Cond> MockRpcSinkBlockRecv<'a, Cond>
-    where
-        Cond: Fn() -> bool + 'a,
-    {
-        fn new(sink: &'a MockRpcSink, cond: Cond) -> Self {
-            Self { sink, cond }
-        }
-    }
-
-    impl<'a, Cond> Future for MockRpcSinkBlockRecv<'a, Cond>
-    where
-        Cond: Fn() -> bool + 'a,
-    {
-        type Output = ();
-
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            if !(self.cond)() {
-                Poll::Ready(())
-            } else {
-                self.sink.recv_waker.register(cx.waker());
-                if !(self.cond)() {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
-    }
-
-    impl MockRpcSink {
-        fn new() -> MockRpcSink {
-            MockRpcSink {
-                value: Arc::new(Mutex::new(None)),
-                send_waker: Arc::new(AtomicWaker::new()),
-                recv_waker: Arc::new(AtomicWaker::new()),
-                injected_send_error: Arc::new(Mutex::new(None)),
-                sink_closed: Arc::new(AtomicBool::new(false)),
-            }
-        }
-
-        async fn recv(&self) -> Option<MockCdcEvent> {
-            let value_clone = self.value.clone();
-            MockRpcSinkBlockRecv::new(self, move || {
-                value_clone.lock().unwrap().is_none() && !self.sink_closed.load(Ordering::SeqCst)
-            })
-            .await;
-
-            let ret = self.value.lock().unwrap().take();
-            self.send_waker.wake();
-            ret
-        }
-
-        fn inject_send_error(&self, err: MockRpcError) {
-            *self.injected_send_error.lock().unwrap() = Some(err);
-            self.send_waker.wake();
-        }
-    }
-
-    impl Sink<(MockCdcEvent, MockWriteFlag)> for MockRpcSink {
-        type Error = MockRpcError;
-
-        fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            if self.sink_closed.load(Ordering::SeqCst) {
-                return Poll::Ready(Err(MockRpcError::SinkClosed));
-            }
-            if let Some(err) = self.injected_send_error.lock().unwrap().take() {
-                return Poll::Ready(Err(err));
-            }
-            let value_guard = self.value.lock().unwrap();
-            if value_guard.is_none() {
-                Poll::Ready(Ok(()))
-            } else {
-                self.send_waker.register(cx.waker());
-                Poll::Pending
-            }
-        }
-
-        fn start_send(self: Pin<&mut Self>, item: (u64, MockWriteFlag)) -> Result<(), Self::Error> {
-            if self.sink_closed.load(Ordering::SeqCst) {
-                return Err(MockRpcError::SinkClosed);
-            }
-            if let Some(err) = self.injected_send_error.lock().unwrap().take() {
-                return Err(err);
-            }
-            let (value, _) = item;
-            *self.value.lock().unwrap() = Some(value);
-            self.recv_waker.wake();
-            Ok(())
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            if let Some(err) = self.injected_send_error.lock().unwrap().take() {
-                return Poll::Ready(Err(err));
-            }
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            if let Some(err) = self.injected_send_error.lock().unwrap().take() {
-                return Poll::Ready(Err(err));
-            }
-            self.sink_closed.store(true, Ordering::SeqCst);
-            self.recv_waker.wake();
-            Poll::Ready(Ok(()))
-        }
-    }
 
     /// test_basic_realtime tests the situation where a sender sends 10 real-time events consecutively,
     /// and then the receiver reads them.

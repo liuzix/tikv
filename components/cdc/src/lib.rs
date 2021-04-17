@@ -16,7 +16,7 @@ mod endpoint;
 mod errors;
 pub mod metrics;
 mod observer;
-mod rate_limiter;
+pub mod rate_limiter;
 mod service;
 
 pub use endpoint::{CdcTxnExtraScheduler, Endpoint, Task};
