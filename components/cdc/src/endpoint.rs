@@ -43,6 +43,7 @@ use tikv_util::timer::SteadyTimer;
 use tikv_util::worker::{Runnable, RunnableWithTimer, ScheduleError, Scheduler};
 use tikv_util::{box_err, box_try, debug, error, impl_display_as_debug, info, warn};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::Semaphore;
 use txn_types::{Key, Lock, LockType, TimeStamp, TxnExtra, TxnExtraScheduler};
 
 use crate::channel::SendError;
@@ -245,6 +246,8 @@ pub struct Endpoint<T> {
     tikv_clients: Arc<Mutex<HashMap<u64, TikvClient>>>,
     env: Arc<Environment>,
     security_mgr: Arc<SecurityManager>,
+
+    concurrency_sema: Arc<Semaphore>,
 }
 
 impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
@@ -306,6 +309,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
             unresolved_region_count: 0,
             hibernate_regions_compatible: cfg.hibernate_regions_compatible,
             tikv_clients: Arc::new(Mutex::new(HashMap::default())),
+            concurrency_sema: Arc::new(Semaphore::new(16)),
         };
         ep.register_min_ts_event();
         ep
@@ -517,6 +521,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
             observe_id,
             checkpoint_ts: checkpoint_ts.into(),
             build_resolver: is_new_delegate,
+            concurrency_sema: self.concurrency_sema.clone(),
         };
 
         let (cb, fut) = tikv_util::future::paired_future_callback();
@@ -1033,6 +1038,7 @@ struct Initializer {
     max_scan_batch_size: usize,
 
     build_resolver: bool,
+    concurrency_sema: Arc<Semaphore>,
 }
 
 impl Initializer {
@@ -1140,6 +1146,7 @@ impl Initializer {
         scanner: &mut DeltaScanner<S>,
         resolver: Option<&mut Resolver>,
     ) -> Result<Vec<Option<TxnEntry>>> {
+        let sema_permit = self.concurrency_sema.acquire().await;
         let mut entries = Vec::with_capacity(self.max_scan_batch_size);
         let mut total_bytes = 0;
         let mut total_size = 0;
@@ -1160,6 +1167,7 @@ impl Initializer {
             self.speed_limter.consume(total_bytes).await;
             CDC_SCAN_BYTES.inc_by(total_bytes as _);
         }
+        drop(sema_permit);
 
         if let Some(resolver) = resolver {
             // Track the locks.
