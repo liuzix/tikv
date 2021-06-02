@@ -1,5 +1,6 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::cell::RefCell;
 use std::f64::INFINITY;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -43,7 +44,6 @@ use tikv_util::timer::SteadyTimer;
 use tikv_util::worker::{Runnable, RunnableWithTimer, ScheduleError, Scheduler};
 use tikv_util::{box_err, box_try, debug, error, impl_display_as_debug, info, warn};
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::Semaphore;
 use txn_types::{Key, Lock, LockType, TimeStamp, TxnExtra, TxnExtraScheduler};
 
 use crate::channel::SendError;
@@ -52,6 +52,7 @@ use crate::metrics::*;
 use crate::old_value::{OldValueCache, OldValueCallback};
 use crate::service::{CdcEvent, Conn, ConnID, FeatureGate};
 use crate::{CdcObserver, Error, Result};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const FEATURE_RESOLVED_TS_STORE: Feature = Feature::require(5, 0, 0);
 
@@ -246,8 +247,6 @@ pub struct Endpoint<T> {
     tikv_clients: Arc<Mutex<HashMap<u64, TikvClient>>>,
     env: Arc<Environment>,
     security_mgr: Arc<SecurityManager>,
-
-    concurrency_sema: Arc<Semaphore>,
 }
 
 impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
@@ -309,7 +308,6 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
             unresolved_region_count: 0,
             hibernate_regions_compatible: cfg.hibernate_regions_compatible,
             tikv_clients: Arc::new(Mutex::new(HashMap::default())),
-            concurrency_sema: Arc::new(Semaphore::new(16)),
         };
         ep.register_min_ts_event();
         ep
@@ -521,7 +519,6 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
             observe_id,
             checkpoint_ts: checkpoint_ts.into(),
             build_resolver: is_new_delegate,
-            concurrency_sema: self.concurrency_sema.clone(),
         };
 
         let (cb, fut) = tikv_util::future::paired_future_callback();
@@ -1038,7 +1035,11 @@ struct Initializer {
     max_scan_batch_size: usize,
 
     build_resolver: bool,
-    concurrency_sema: Arc<Semaphore>,
+}
+
+struct ScanContext<S> {
+    scanner: RefCell<S>,
+    resolver: RefCell<Option<Resolver>>,
 }
 
 impl Initializer {
@@ -1086,7 +1087,7 @@ impl Initializer {
             "downstream_id" => ?downstream_id,
             "observe_id" => ?self.observe_id);
 
-        let mut resolver = if self.build_resolver {
+        let resolver = if self.build_resolver {
             Some(Resolver::new(region_id))
         } else {
             None
@@ -1097,12 +1098,18 @@ impl Initializer {
         let start = Instant::now_coarse();
         // Time range: (checkpoint_ts, current]
         let current = TimeStamp::max();
-        let mut scanner = ScannerBuilder::new(snap, current, false)
+        let scanner = ScannerBuilder::new(snap, current, false)
             .range(None, None)
             .build_delta_scanner(self.checkpoint_ts, self.txn_extra_op)
             .unwrap();
         let conn_id = self.conn_id;
         let mut done = false;
+
+        let scan_context = Arc::new(Mutex::new(ScanContext{
+            scanner: RefCell::new(scanner),
+            resolver: RefCell::new(resolver),
+        }));
+
         while !done {
             if self.downstream_state.load() != DownstreamState::Normal {
                 info!("cdc async incremental scan canceled";
@@ -1113,7 +1120,7 @@ impl Initializer {
                 self.deregister_downstream(None);
                 return;
             }
-            let entries = match self.scan_batch(&mut scanner, resolver.as_mut()).await {
+            let entries = match self.scan_batch(scan_context.clone()).await {
                 Ok(res) => res,
                 Err(e) => {
                     error!("cdc scan entries failed"; "error" => ?e, "region_id" => region_id);
@@ -1134,57 +1141,67 @@ impl Initializer {
         }
 
         let takes = start.elapsed();
-        if let Some(resolver) = resolver {
+        if let Some(resolver) = scan_context.lock().unwrap().resolver.take() {
             self.finish_building_resolver(resolver, region, takes);
         }
 
         CDC_SCAN_DURATION_HISTOGRAM.observe(takes.as_secs_f64());
     }
 
-    async fn scan_batch<S: Snapshot>(
+    async fn scan_batch<S: Snapshot + 'static>(
         &self,
-        scanner: &mut DeltaScanner<S>,
-        resolver: Option<&mut Resolver>,
+        scan_context: Arc<Mutex<ScanContext<DeltaScanner<S>>>>,
     ) -> Result<Vec<Option<TxnEntry>>> {
-        let sema_permit = self.concurrency_sema.acquire().await;
-        let mut entries = Vec::with_capacity(self.max_scan_batch_size);
-        let mut total_bytes = 0;
-        let mut total_size = 0;
-        while total_bytes <= self.max_scan_batch_bytes && total_size < self.max_scan_batch_size {
-            total_size += 1;
-            match scanner.next_entry()? {
-                Some(entry) => {
-                    total_bytes += entry.size();
-                    entries.push(Some(entry));
-                }
-                None => {
-                    entries.push(None);
-                    break;
+        let total_bytes = Arc::new(AtomicUsize::new(0));
+        let total_bytes_clone = total_bytes.clone();
+        let max_scan_batch_size = self.max_scan_batch_size;
+        let max_scan_batch_bytes = self.max_scan_batch_bytes;
+        let job_handle = tokio::task::spawn_blocking(move || {
+            let ctx = scan_context.lock().unwrap();
+            let mut scanner = ctx.scanner.borrow_mut();
+
+            let mut entries = Vec::with_capacity(max_scan_batch_size);
+            let mut total_size = 0;
+            while total_bytes_clone.load(Ordering::Acquire) <= max_scan_batch_bytes && total_size < max_scan_batch_size {
+                total_size += 1;
+                match scanner.next_entry()? {
+                    Some(entry) => {
+                        total_bytes_clone.fetch_add(entry.size(), Ordering::Acquire);
+                        entries.push(Some(entry));
+                    }
+                    None => {
+                        entries.push(None);
+                        break;
+                    }
                 }
             }
-        }
+
+            if let Some(ref mut resolver) = &mut *ctx.resolver.borrow_mut() {
+                // Track the locks.
+                for entry in entries.iter().flatten() {
+                    if let TxnEntry::Prewrite { lock, .. } = entry {
+                        let (encoded_key, value) = lock;
+                        let key = Key::from_encoded_slice(encoded_key).into_raw().unwrap();
+                        let lock = Lock::parse(value)?;
+                        match lock.lock_type {
+                            LockType::Put | LockType::Delete => resolver.track_lock(lock.ts, key, None),
+                            _ => (),
+                        };
+                    }
+                }
+            }
+
+            Ok(entries)
+        });
+
+        let entries = job_handle.await.unwrap();
+        let total_bytes = total_bytes.load(Ordering::Release);
         if total_bytes > 0 {
             self.speed_limter.consume(total_bytes).await;
             CDC_SCAN_BYTES.inc_by(total_bytes as _);
         }
-        drop(sema_permit);
 
-        if let Some(resolver) = resolver {
-            // Track the locks.
-            for entry in entries.iter().flatten() {
-                if let TxnEntry::Prewrite { lock, .. } = entry {
-                    let (encoded_key, value) = lock;
-                    let key = Key::from_encoded_slice(encoded_key).into_raw().unwrap();
-                    let lock = Lock::parse(value)?;
-                    match lock.lock_type {
-                        LockType::Put | LockType::Delete => resolver.track_lock(lock.ts, key, None),
-                        _ => (),
-                    };
-                }
-            }
-        }
-
-        Ok(entries)
+        entries
     }
 
     async fn sink_scan_events(
