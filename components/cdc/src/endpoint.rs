@@ -1162,11 +1162,11 @@ impl Initializer {
 
             let mut entries = Vec::with_capacity(max_scan_batch_size);
             let mut total_size = 0;
-            while total_bytes_clone.load(Ordering::Acquire) <= max_scan_batch_bytes && total_size < max_scan_batch_size {
+            while total_bytes_clone.load(Ordering::Relaxed) <= max_scan_batch_bytes && total_size < max_scan_batch_size {
                 total_size += 1;
                 match scanner.next_entry()? {
                     Some(entry) => {
-                        total_bytes_clone.fetch_add(entry.size(), Ordering::Acquire);
+                        total_bytes_clone.fetch_add(entry.size(), Ordering::Relaxed);
                         entries.push(Some(entry));
                     }
                     None => {
@@ -1195,7 +1195,7 @@ impl Initializer {
         });
 
         let entries = job_handle.await.unwrap();
-        let total_bytes = total_bytes.load(Ordering::Release);
+        let total_bytes = total_bytes.load(Ordering::Relaxed);
         if total_bytes > 0 {
             self.speed_limter.consume(total_bytes).await;
             CDC_SCAN_BYTES.inc_by(total_bytes as _);
