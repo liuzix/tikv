@@ -265,6 +265,7 @@ impl<T: 'static + RaftStoreRouter<RocksEngine>> Endpoint<T> {
             .threaded_scheduler()
             .thread_name("cdcwkr")
             .core_threads(4)
+            .max_threads(32)
             .build()
             .unwrap();
         let tso_worker = Builder::new()
