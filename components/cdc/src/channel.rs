@@ -15,6 +15,7 @@ use grpcio::WriteFlags;
 use kvproto::cdcpb::ChangeDataEvent;
 
 use tikv_util::{impl_display_as_debug, warn};
+use fail::fail_point;
 
 use crate::service::{CdcEvent, EventBatcher};
 
@@ -125,6 +126,9 @@ pub struct Sink {
 
 impl Sink {
     pub fn unbounded_send(&self, event: CdcEvent, force: bool) -> Result<(), SendError> {
+        fail_point!("cdc_inject_congestion", |_| {
+            Err(SendError::Congested)
+        });
         // Try it's best to send error events.
         let bytes = if !force { event.size() as usize } else { 0 };
         if bytes != 0 && !self.memory_quota.alloc(bytes) {
