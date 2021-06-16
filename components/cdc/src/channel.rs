@@ -126,7 +126,9 @@ pub struct Sink {
 
 impl Sink {
     pub fn unbounded_send(&self, event: CdcEvent, force: bool) -> Result<(), SendError> {
-        fail_point!("cdc_inject_congestion", |_| Err(SendError::Congested));
+        if !force {
+            fail_point!("cdc_inject_congestion", |_| Err(SendError::Congested));
+        }
         // Try it's best to send error events.
         let bytes = if !force { event.size() as usize } else { 0 };
         if bytes != 0 && !self.memory_quota.alloc(bytes) {
